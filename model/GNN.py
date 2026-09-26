@@ -23,31 +23,43 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-try:
-    from torch_geometric.nn import SAGEConv
-except ImportError as exc:  # pragma: no cover - depends on user's environment
-    raise SystemExit(
-        "This script requires torch-geometric. Install a version matching your "
-        "PyTorch build: https://pytorch-geometric.readthedocs.io/en/latest/install/"
-    ) from exc
+class EdgeWeightedMessagePassing(nn.Module):
+    """Mean GraphSAGE-style aggregation with normalized Hi-C edge weights."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.self_linear = nn.Linear(input_dim, output_dim)
+        self.neighbor_linear = nn.Linear(input_dim, output_dim, bias=False)
+        self.norm = nn.LayerNorm(output_dim)
+        self.residual = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
+
+    def forward(self, x: Tensor, edge_index: Tensor, edge_weight: Tensor) -> Tensor:
+        source, target = edge_index
+        # Log compression prevents a few high-count contacts from dominating.
+        weight = torch.log1p(edge_weight.float()).clamp_min(0.0)
+        denominator = torch.zeros(x.size(0), device=x.device, dtype=weight.dtype)
+        denominator.index_add_(0, target, weight)
+        normalized_weight = weight / denominator[target].clamp_min(1e-12)
+        messages = self.neighbor_linear(x[source]) * normalized_weight.unsqueeze(1)
+        aggregated = torch.zeros((x.size(0), messages.size(1)), device=x.device, dtype=messages.dtype)
+        aggregated.index_add_(0, target, messages)
+        # The residual/self term preserves the center bin's own features.
+        return self.norm(self.self_linear(x) + aggregated + self.residual(x))
 
 
 class GraphSAGEEncoder(nn.Module):
-    """Weighted two-layer GraphSAGE encoder for node representation learning."""
+    """Two-layer edge-weighted message-passing encoder for Hi-C graphs."""
 
     def __init__(self, input_dim: int, hidden_dim: int, embedding_dim: int, dropout: float):
         super().__init__()
-        self.conv1 = SAGEConv(input_dim, hidden_dim)
-        self.conv2 = SAGEConv(hidden_dim, embedding_dim)
+        self.conv1 = EdgeWeightedMessagePassing(input_dim, hidden_dim)
+        self.conv2 = EdgeWeightedMessagePassing(hidden_dim, embedding_dim)
         self.dropout = dropout
 
     def forward(self, x: Tensor, edge_index: Tensor, edge_weight: Tensor) -> Tensor:
-        # SAGEConv does not use edge weights directly; scale messages by the
-        # normalized contact strength through a weighted residual feature.
-        h = self.conv1(x, edge_index)
-        h = F.relu(h)
+        h = F.gelu(self.conv1(x, edge_index, edge_weight))
         h = F.dropout(h, p=self.dropout, training=self.training)
-        return self.conv2(h, edge_index)
+        return self.conv2(h, edge_index, edge_weight)
 
 
 class GraphModel(nn.Module):
@@ -60,6 +72,26 @@ class GraphModel(nn.Module):
 
     def forward(self, x: Tensor, edge_index: Tensor, edge_weight: Tensor) -> Tensor:
         return self.encoder(x, edge_index, edge_weight)
+
+
+class MultiLabelClassifier(nn.Module):
+    """Non-linear multi-label head; sigmoid is applied only for inference."""
+
+    def __init__(self, input_dim: int, hidden_dim: int = 64, dropout: float = 0.25):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 3),
+        )
+
+    def forward(self, features: Tensor) -> Tensor:
+        return self.network(features)
 
 
 def _resolve_input(path: Path) -> Path:
@@ -237,7 +269,7 @@ def train_classifier(features: np.ndarray, labels: np.ndarray, device: torch.dev
         train_idx = np.arange(features.shape[0], dtype=np.int64)
     x = torch.from_numpy(features[train_idx]).to(device)
     y = torch.from_numpy(labels[train_idx]).to(device)
-    classifier = nn.Sequential(nn.LayerNorm(x.size(1)), nn.Linear(x.size(1), 3)).to(device)
+    classifier = MultiLabelClassifier(x.size(1)).to(device)
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=2e-3, weight_decay=1e-4)
     positive = y.sum(dim=0).clamp_min(1.0)
     negative = (y.size(0) - positive).clamp_min(1.0)
@@ -254,6 +286,131 @@ def train_classifier(features: np.ndarray, labels: np.ndarray, device: torch.dev
         predicted = (probabilities >= 0.5).float()
         micro_accuracy = float((predicted == y).float().mean().cpu())
     return classifier, {"train_binary_accuracy": micro_accuracy, "positive_counts": labels[train_idx].sum(axis=0).tolist(), "train_size": int(train_idx.size)}
+
+
+class CSRNeighborSampler:
+    """CPU CSR sampler for local contact subgraphs."""
+
+    def __init__(self, edge_index: Tensor, edge_weight: Tensor, seed: int):
+        source = edge_index[0].detach().cpu().numpy().astype(np.int64, copy=False)
+        target = edge_index[1].detach().cpu().numpy().astype(np.int64, copy=False)
+        weight = edge_weight.detach().cpu().numpy().astype(np.float32, copy=False)
+        order = np.argsort(source, kind="stable")
+        self.nodes = int(edge_index.max().item()) + 1
+        self.rowptr = np.zeros(self.nodes + 1, dtype=np.int64)
+        np.add.at(self.rowptr, source + 1, 1)
+        self.rowptr = np.cumsum(self.rowptr, dtype=np.int64)
+        self.col = target[order]
+        self.weight = weight[order]
+        self.rng = np.random.default_rng(seed)
+
+    def sample(self, centers: np.ndarray, hops: int, fanout: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        selected = list(map(int, centers.tolist()))
+        seen = set(selected)
+        frontier = selected
+        for _ in range(hops):
+            next_frontier = []
+            for node in frontier:
+                start, end = self.rowptr[node], self.rowptr[node + 1]
+                neighbors = self.col[start:end]
+                if neighbors.size > fanout:
+                    chosen = self.rng.choice(neighbors.size, size=fanout, replace=False)
+                    neighbors = neighbors[chosen]
+                for neighbor in neighbors.tolist():
+                    if int(neighbor) not in seen:
+                        seen.add(int(neighbor))
+                        next_frontier.append(int(neighbor))
+            selected.extend(next_frontier)
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        node_ids = np.asarray(selected, dtype=np.int64)
+        local = {int(node): index for index, node in enumerate(selected)}
+        rows, cols, weights = [], [], []
+        for source_node in selected:
+            start, end = self.rowptr[source_node], self.rowptr[source_node + 1]
+            for target_node, edge_value in zip(self.col[start:end], self.weight[start:end]):
+                target_int = int(target_node)
+                if target_int in local:
+                    rows.append(local[source_node])
+                    cols.append(local[target_int])
+                    weights.append(float(edge_value))
+        sub_edge_index = np.asarray([rows, cols], dtype=np.int64)
+        sub_edge_weight = np.asarray(weights, dtype=np.float32)
+        return node_ids, sub_edge_index, sub_edge_weight
+
+
+def encode_centers_minibatch(model: GraphModel, x: Tensor, edge_index: Tensor, edge_weight: Tensor, centers: np.ndarray, args: argparse.Namespace, device: torch.device, sampler: CSRNeighborSampler) -> tuple[Tensor, np.ndarray]:
+    """Encode centers through sampled subgraphs without retaining autograd graphs."""
+    model.eval()
+    node_embeddings, pooled_embeddings = [], []
+    with torch.no_grad():
+        for start in range(0, centers.size, args.batch_size):
+            batch_centers = centers[start : start + args.batch_size]
+            node_ids, sub_edges, sub_weights = sampler.sample(batch_centers, args.radius + 2, args.fanout)
+            sub_x = x[torch.as_tensor(node_ids, device=device)]
+            sub_edge_index = torch.as_tensor(sub_edges, device=device, dtype=torch.long)
+            sub_edge_weight = torch.as_tensor(sub_weights, device=device)
+            sub_z = model(sub_x, sub_edge_index, sub_edge_weight)
+            center_positions = np.arange(batch_centers.size, dtype=np.int64)
+            sub_pooled = local_embeddings(sub_z, sub_edge_index, center_positions, args.radius)
+            node_embeddings.append(sub_z[: batch_centers.size].cpu())
+            pooled_embeddings.append(sub_pooled.cpu())
+    return torch.cat(node_embeddings), torch.cat(pooled_embeddings).numpy().astype(np.float32)
+
+
+def train_supervised_encoder(model: GraphModel, x: Tensor, edge_index: Tensor, edge_weight: Tensor, centers: np.ndarray, labels: np.ndarray, train_idx: np.ndarray, args: argparse.Namespace, device: torch.device) -> tuple[nn.Module, dict[str, object]]:
+    """Jointly optimize GNN message passing and the nonlinear label head."""
+    sampler = CSRNeighborSampler(edge_index, edge_weight, args.seed)
+    feature_dim = args.embedding_dim + 2
+    classifier = MultiLabelClassifier(feature_dim, hidden_dim=args.classifier_hidden_dim).to(device)
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(classifier.parameters()),
+        lr=args.supervised_lr,
+        weight_decay=1e-5,
+    )
+    train_labels = labels[train_idx]
+    positive = torch.from_numpy(train_labels.sum(axis=0)).to(device).clamp_min(1.0)
+    negative = torch.tensor(float(train_labels.shape[0]), device=device) - positive
+    pos_weight = (negative.clamp_min(1.0) / positive).float()
+    y = torch.from_numpy(train_labels).to(device)
+    model.train()
+    classifier.train()
+    batch_size = args.batch_size
+    train_rng = np.random.default_rng(args.seed)
+    for epoch in range(1, args.classifier_epochs + 1):
+        epoch_loss = 0.0
+        shuffled = train_rng.permutation(train_idx)
+        for start in range(0, shuffled.size, batch_size):
+            batch_positions = shuffled[start : start + batch_size]
+            batch_centers = centers[batch_positions]
+            node_ids, sub_edges, sub_weights = sampler.sample(batch_centers, args.radius + 2, args.fanout)
+            sub_x = x[torch.as_tensor(node_ids, device=device)]
+            sub_edge_index = torch.as_tensor(sub_edges, device=device, dtype=torch.long)
+            sub_edge_weight = torch.as_tensor(sub_weights, device=device)
+            center_positions = np.arange(batch_centers.size, dtype=np.int64)
+            optimizer.zero_grad(set_to_none=True)
+            sub_z = model(sub_x, sub_edge_index, sub_edge_weight)
+            pooled = local_embeddings(sub_z, sub_edge_index, center_positions, args.radius)
+            # ``batch_positions`` indexes the full center/label arrays, while
+            # ``y`` only contains the compact training subset. Index the source
+            # labels directly to avoid mixing global and local indices.
+            batch_labels = torch.from_numpy(labels[batch_positions]).to(device)
+            loss = F.binary_cross_entropy_with_logits(classifier(pooled), batch_labels, pos_weight=pos_weight)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(classifier.parameters()), 5.0)
+            optimizer.step()
+            epoch_loss += float(loss.detach().cpu()) * batch_positions.size / shuffled.size
+        if epoch == 1 or epoch % max(1, args.classifier_epochs // 10) == 0:
+            print(f"supervised epoch {epoch:03d}/{args.classifier_epochs} loss={epoch_loss:.5f}")
+    classifier.eval()
+    with torch.no_grad():
+        _, train_pooled = encode_centers_minibatch(model, x, edge_index, edge_weight, centers[train_idx], args, device, sampler)
+        train_probability = torch.sigmoid(classifier(torch.from_numpy(train_pooled).to(device)))
+        train_prediction = (train_probability >= 0.5).float()
+        accuracy = float((train_prediction == y).float().mean().cpu())
+    return classifier, {"train_binary_accuracy": accuracy, "positive_counts": train_labels.sum(axis=0).tolist(), "train_size": int(train_idx.size), "batch_size": int(batch_size), "fanout": int(args.fanout), "training_mode": "end_to_end_supervised_subgraph_minibatch"}
 
 
 def evaluate_classifier(classifier: nn.Module, features: np.ndarray, labels: np.ndarray, device: torch.device) -> dict[str, object]:
@@ -349,6 +506,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=("unsupervised", "supervised"), default="unsupervised")
     parser.add_argument("--labels", type=Path, default=root / "data/datasets", help="Directory containing OPCID_data.xlsx, CHIN_data.xlsx and CHID_data.xlsx.")
     parser.add_argument("--classifier-epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32, help="Number of center embeddings per supervised training batch (default: 32).")
+    parser.add_argument("--fanout", type=int, default=15, help="Maximum neighbors sampled per node per hop in supervised subgraph batches.")
+    parser.add_argument("--classifier-hidden-dim", type=int, default=64)
+    parser.add_argument("--supervised-lr", type=float, default=1e-3)
     parser.add_argument("--test-fraction", type=float, default=0.15, help="Random test fraction within the current graph (default: 15%%).")
     parser.add_argument("--novelty-threshold", type=float, default=0.55, help="Known-class confidence below this marks an unlabelled embedding as a novel candidate.")
     parser.add_argument("--epochs", type=int, default=30)
@@ -368,23 +529,41 @@ def main() -> None:
         raise SystemExit("--epochs and --radius must be positive")
     if not 0 < args.test_fraction < 1:
         raise SystemExit("--test-fraction must be between 0 and 1")
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be positive")
+    if args.fanout <= 0:
+        raise SystemExit("--fanout must be positive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     arrays, x, edge_index, edge_weight, input_path = load_graph(args.input, device)
     model = GraphModel(x.size(1), args.hidden_dim, args.embedding_dim).to(device)
-    train_encoder(model, x, edge_index, edge_weight, args, device)
-    z, centers, pooled = encode_and_pool(model, x, edge_index, edge_weight, args)
-    stem = input_path.stem
-
-    classifier_stats = {"task": args.task}
     if args.task == "supervised":
+        # Choose centers and labels before joint optimization. The labels are
+        # fixed coordinates; the GNN and nonlinear head are then optimized
+        # together against the train subset.
+        with torch.no_grad():
+            node_count = x.size(0)
+            if args.centers == 0 or args.centers >= node_count:
+                centers = np.arange(node_count, dtype=np.int64)
+            else:
+                centers = np.linspace(0, node_count - 1, args.centers, dtype=np.int64)
         labels = labels_for_centers(arrays, centers, args.labels)
         train_idx, test_idx = split_label_indices(labels, args.test_fraction, args.seed)
-        classifier, classifier_stats = train_classifier(
-            pooled, labels, device, args.classifier_epochs, args.seed, train_idx
+        classifier, classifier_stats = train_supervised_encoder(
+            model, x, edge_index, edge_weight, centers, labels, train_idx, args, device
         )
+        sampler = CSRNeighborSampler(edge_index, edge_weight, args.seed)
+        z, pooled = encode_centers_minibatch(model, x, edge_index, edge_weight, centers, args, device, sampler)
+    else:
+        train_encoder(model, x, edge_index, edge_weight, args, device)
+        z, centers, pooled = encode_and_pool(model, x, edge_index, edge_weight, args)
+        labels = np.empty((0, 3), dtype=np.float32)
+    stem = input_path.stem
+
+    classifier_stats = {"task": args.task} if args.task == "unsupervised" else classifier_stats
+    if args.task == "supervised":
         args.output_dir.mkdir(parents=True, exist_ok=True)
         torch.save(classifier.state_dict(), args.output_dir / f"{stem}_classifier.pt")
         test_pooled = pooled[test_idx]
@@ -394,9 +573,6 @@ def main() -> None:
         classifier_stats["test"]["novel_candidate_count"] = int(test_candidate.sum())
         save_embeddings(args.output_dir, f"{stem}_random_test", arrays, centers[test_idx], z, test_pooled, test_labels, {"split": "random_test", "train_input": str(input_path), "test_fraction": args.test_fraction, "radius": args.radius, "embedding_dim": int(test_pooled.shape[1]), "novelty_threshold": args.novelty_threshold}, probabilities=test_probabilities, novelty_score=test_novelty, novel_candidate=test_candidate)
         classifier_stats["split"] = {"train_size": int(train_idx.size), "test_size": int(test_idx.size), "test_fraction": args.test_fraction}
-    else:
-        labels = np.empty((0, 3), dtype=np.float32)
-
     torch.save(model.state_dict(), args.output_dir / f"{stem}_encoder.pt")
     train_probabilities = train_novelty = train_candidate = None
     if args.task == "supervised":
