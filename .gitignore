@@ -1,0 +1,6 @@
+# 大文件不入库：Hi-C 接触矩阵太大
+*.cool
+
+# Python 缓存
+__pycache__/
+*.pyc

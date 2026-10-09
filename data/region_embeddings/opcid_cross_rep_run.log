@@ -1,0 +1,46 @@
+﻿{"strategy": "annotated", "train_samples": 334, "test_samples": 334, "n_positive": 68, "n_negative": 266, "device": "cpu"}
+epoch 1/30  loss=0.5497
+epoch 5/30  loss=0.5028
+epoch 10/30  loss=0.4367
+epoch 15/30  loss=0.0332
+epoch 20/30  loss=0.0083
+epoch 25/30  loss=0.0050
+epoch 30/30  loss=0.0028
+{
+  "report": {
+    "fixed": {
+      "threshold": 0.5,
+      "accuracy": 0.703592836856842,
+      "precision": 0.35514018691588456,
+      "recall": 0.5588235294117565,
+      "f1": 0.43428571428523416,
+      "tp": 38.0,
+      "fp": 69.0,
+      "fn": 30.0,
+      "tn": 197.0
+    },
+    "best_f1": {
+      "threshold": 0.6,
+      "accuracy": 0.7455089688301086,
+      "precision": 0.40659340659340215,
+      "recall": 0.5441176470588156,
+      "f1": 0.4654088050309512,
+      "tp": 37.0,
+      "fp": 54.0,
+      "fn": 31.0,
+      "tn": 212.0
+    },
+    "best_recall": {
+      "threshold": 0.1,
+      "accuracy": 0.5628742575645447,
+      "precision": 0.28571428571428414,
+      "recall": 0.76470588235293,
+      "f1": 0.4159999999996006,
+      "tp": 52.0,
+      "fp": 130.0,
+      "fn": 16.0,
+      "tn": 136.0
+    }
+  }
+}
+saved -> data\region_embeddings\GSE272159_37C_rep1.mapq_30.10_top40_opcid_cnn_independent.pt
