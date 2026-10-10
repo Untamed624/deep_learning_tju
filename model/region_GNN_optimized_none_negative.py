@@ -11,12 +11,40 @@ import argparse
 import gc
 import json
 import os
+import random
 from pathlib import Path
 
 import numpy as np
+
+# cuBLAS must receive this setting before CUDA kernels are initialized.
+# It makes supported CUDA matrix operations reproducible across runs.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+
+def _load_pt_checkpoint(path, device):
+    """Load checkpoints created on either Windows or Linux."""
+    import pathlib
+
+    saved_windows_path = pathlib.WindowsPath
+    saved_posix_path = pathlib.PosixPath
+    try:
+        # Pickle stores the concrete pathlib class used by the writer.  Map
+        # it to the native class while unpickling on the other OS.
+        if os.name == "nt":
+            pathlib.PosixPath = pathlib.WindowsPath
+        else:
+            pathlib.WindowsPath = pathlib.PosixPath
+        try:
+            return torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=device)
+    finally:
+        pathlib.WindowsPath = saved_windows_path
+        pathlib.PosixPath = saved_posix_path
 
 
 def _json_default(value):
@@ -34,6 +62,46 @@ def _json_default(value):
             return value.detach().cpu().item()
         return value.detach().cpu().tolist()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _configure_reproducibility(seed: int):
+    """Configure best-effort deterministic CPU/CUDA execution for one run."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # cuDNN's autotuner can choose different kernels between runs.
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        # Disable TF32 so Ampere+ GPUs do not trade reproducibility/precision
+        # for throughput in float32 matrix operations.
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+    # Some CUDA scatter/index operations used by GraphSAGE are not available
+    # as deterministic kernels in every PyTorch version. warn_only preserves
+    # compatibility while enforcing deterministic kernels where supported.
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        torch.use_deterministic_algorithms(True)
+    return {
+        "seed": seed,
+        "cuda_available": bool(cuda_available),
+        "deterministic_algorithms": True,
+        "cudnn_deterministic": bool(cuda_available),
+        "cudnn_benchmark": False,
+        "tf32_disabled": bool(cuda_available),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
 
 
 def _write_evaluation_report(test_metrics, output_dir: Path, stem: str):
@@ -814,6 +882,9 @@ def _collate_region_batch(samples):
 def _worker_init_fn(_worker_id):
     # Prevent every worker from creating its own large OpenMP thread pool.
     torch.set_num_threads(1)
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def _make_loader(
@@ -888,6 +959,7 @@ def main():
     parser.add_argument("--chid-test-npz", type=Path, default=None)
     parser.add_argument("--labels", type=Path, default=root / "data/datasets")
     parser.add_argument("--output-dir", type=Path, default=root / "data/region_embeddings")
+    parser.add_argument("--pt-test", type=Path, default=None, help="Load an existing .pt checkpoint and evaluate it without training.")
     parser.add_argument(
         "--evaluate",
         action="store_true",
@@ -962,6 +1034,21 @@ def main():
     parser.add_argument("--scan-window", type=int, default=0, help="Window size in bp; 0 uses the median positive region size.")
     parser.add_argument("--scan-step", type=int, default=500)
     args = parser.parse_args()
+    pt_checkpoint = None
+    if args.pt_test is not None:
+        if not args.pt_test.is_file():
+            raise SystemExit(f"Missing checkpoint: {args.pt_test}")
+        pt_checkpoint = _load_pt_checkpoint(args.pt_test, "cpu")
+        saved_args = pt_checkpoint.get("args", {})
+        for name in ("hidden_dim", "embedding_dim", "classifier_hidden_dim", "opcid_verifier", "patch_size"):
+            if name in saved_args:
+                setattr(args, name, saved_args[name])
+        if "class_thresholds" in pt_checkpoint:
+            args.opcid_threshold, args.chin_threshold, args.chid_threshold = pt_checkpoint["class_thresholds"]
+        if "opcid_verifier_threshold" in pt_checkpoint:
+            args.opcid_verifier_threshold = float(pt_checkpoint["opcid_verifier_threshold"])
+        args.dev_earlystop = False
+        args.threshold_finetune = False
     if args.current_dataset:
         args.input = args.input or root / "data/graphs/GSE272159_37C_rep1.mapq_30.10_top40.npz"
         args.test_input = args.test_input or root / "data/graphs/GSE272159_37C_rep2.mapq_30.10_top40.npz"
@@ -1010,8 +1097,7 @@ def main():
     if args.opcid_pos_weight > 0 and not np.isfinite(args.opcid_pos_weight):
         raise SystemExit("opcid-pos-weight must be finite")
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    reproducibility = _configure_reproducibility(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but this PyTorch build/runtime has no available CUDA device.")
@@ -1096,6 +1182,11 @@ def main():
         arrays["x"].shape[1], args.hidden_dim, args.embedding_dim, args.classifier_hidden_dim,
         enable_opcid_verifier=args.opcid_verifier,
     ).to(device)
+    if pt_checkpoint is not None:
+        state = pt_checkpoint.get("specialized_model", pt_checkpoint.get("gnn_encoder"))
+        if state is None:
+            raise ValueError(f"Checkpoint has no model state: {args.pt_test}")
+        model.load_state_dict(state)
     train_labels = np.stack([region[2] for region in train_regions])
     class_weights = torch.from_numpy(
         effective_number_weights(train_labels, args.class_balanced_beta)
@@ -1149,9 +1240,10 @@ def main():
                     "balanced_pool_positive": balanced_positive_count,
                     "balanced_pool_negative": balanced_negative_count,
                     "sample_mode": "current_dataset_rep1_rep2_balanced" if npz_mode else "cooler_custom_split_balanced",
-                    "input_mode": "current-dataset" if npz_mode else "cooler",
-                    "device": str(device),
-                },
+                "input_mode": "current-dataset" if npz_mode else "cooler",
+                "device": str(device),
+                "reproducibility": reproducibility,
+            },
                 ensure_ascii=False,
                 default=_json_default,
             )
@@ -1257,7 +1349,7 @@ def main():
     best_epoch = 0
     best_state = None
     epochs_without_improvement = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, (args.epochs if pt_checkpoint is None else 0) + 1):
         model.train()
         epoch_loss, _, _, _, _ = run_loader(train_loader, training=True)
         val_loss = None
@@ -1407,7 +1499,13 @@ def main():
                 **selection_status,
             }
     thresholds = tuple(thresholds)
-    prototype_state = fit_embedding_prototypes(train_emb, train_y)
+    prototype_state = (
+        pt_checkpoint.get("prototype_state")
+        if pt_checkpoint is not None
+        else fit_embedding_prototypes(train_emb, train_y)
+    )
+    if not prototype_state:
+        prototype_state = fit_embedding_prototypes(train_emb, train_y)
     test_novelty_distance = embedding_novelty_distance(test_emb, prototype_state)
     stats = {
         "train": evaluate_with_thresholds(train_logits, train_y, thresholds, train_verifier_logits if args.opcid_verifier else None, verifier_threshold if args.opcid_verifier else None),
@@ -1445,22 +1543,24 @@ def main():
         "num_workers": args.num_workers,
         "pin_memory": pin_memory,
         "persistent_workers": persistent_workers,
+        "reproducibility": reproducibility,
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stem = args.input.stem
-    torch.save(
-        {
-            "gnn_encoder": model.state_dict(),
-            "specialized_model": model.state_dict(),
-            "args": vars(args),
-            "class_thresholds": thresholds,
-            "prototype_state": prototype_state,
-            "best_epoch": best_epoch,
-            "opcid_pos_weight": opcid_pos_weight,
-            "opcid_verifier_threshold": verifier_threshold,
-        },
-        args.output_dir / f"{stem}_region_model.pt",
-    )
+    if pt_checkpoint is None:
+        torch.save(
+            {
+                "gnn_encoder": model.state_dict(),
+                "specialized_model": model.state_dict(),
+                "args": vars(args),
+                "class_thresholds": thresholds,
+                "prototype_state": prototype_state,
+                "best_epoch": best_epoch,
+                "opcid_pos_weight": opcid_pos_weight,
+                "opcid_verifier_threshold": verifier_threshold,
+            },
+            args.output_dir / f"{stem}_region_model.pt",
+        )
     np.savez_compressed(
         args.output_dir / f"{stem}_region_test.npz",
         embedding=torch.stack(test_emb).numpy(),
